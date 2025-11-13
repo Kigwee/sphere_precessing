@@ -1,32 +1,48 @@
-FC = gfortran
-FFLAGS = -O2 -Wall -Wextra -fcheck=all
+############################
+# COMPILATION SETTINGS
+############################
+
+FC      = gfortran
+FFLAGS  = -O3 -march=native -ffast-math -funroll-loops -fopenmp -Wall
+
+SHTNS_DIR = external/SHTns
+FFTW_DIR  = /usr/lib/x86_64-linux-gnu    # change si besoin
+
+INCLUDES = -I$(SHTNS_DIR) -I$(FFTW_DIR)/include
+LIBS     = -L$(SHTNS_DIR) -lshtns \
+           -L$(FFTW_DIR)/lib -lfftw3 -lfftw3_omp \
+           -llapack -lblas
 
 SRC_DIR = src
 OBJ_DIR = obj
+BIN_DIR = build
 
-SOURCES = $(SRC_DIR)/kinds.f90 \
-          $(SRC_DIR)/params.f90 \
-          $(SRC_DIR)/grid.f90 \
-          $(SRC_DIR)/fields.f90 \
-          $(SRC_DIR)/spectral_transforms.f90 \
-          $(SRC_DIR)/torpol.f90 \
-          $(SRC_DIR)/operators.f90 \
-          $(SRC_DIR)/poisson_radial.f90 \
-          $(SRC_DIR)/time_integration.f90 \
-          $(SRC_DIR)/main.f90
+SOURCES = $(wildcard $(SRC_DIR)/*.f90)
+OBJECTS = $(patsubst $(SRC_DIR)/%.f90,$(OBJ_DIR)/%.o,$(SOURCES))
 
-OBJECTS = $(SOURCES:$(SRC_DIR)/%.f90=$(OBJ_DIR)/%.o)
+TARGET  = $(BIN_DIR)/dns_sphere
 
-TARGET = precess_sphere
+############################
+# RULES
+############################
 
 all: $(TARGET)
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.f90
 	mkdir -p $(OBJ_DIR)
-	$(FC) $(FFLAGS) -c $< -o $@
+	$(FC) $(FFLAGS) $(INCLUDES) -c $< -o $@
 
 $(TARGET): $(OBJECTS)
-	$(FC) $(FFLAGS) $(OBJECTS) -o $@
+	mkdir -p $(BIN_DIR)
+	$(FC) $(FFLAGS) $(OBJECTS) -o $(TARGET) $(LIBS)
 
 clean:
-	rm -rf $(OBJ_DIR) $(TARGET)
+	rm -rf $(OBJ_DIR) $(BIN_DIR)
+
+############################
+# GPU version (optionnel)
+############################
+gpu:
+	make LIBS="$(LIBS) -lcufft" FFLAGS="$(FFLAGS) -DSHTNS_GPU=1"
+
+
