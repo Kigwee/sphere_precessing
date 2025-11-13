@@ -7,72 +7,150 @@ module mod_poisson_radial
   use mod_grid
   implicit none
 
-  ! Matrices factoriées pour chaque ℓ (et éventuellement m)
-  ! Ici on simplifie: même matrice pour tous m à ℓ donné.
+  ! Matrices stockées pleine (NR×NR) pour chaque ℓ
   real(dp), allocatable :: A_W(:,:,:)
   real(dp), allocatable :: A_LapU(:,:,:)
-  integer,  allocatable :: ipiv_W(:,:), ipiv_LapU(:,:)
+
+  ! Pivots LAPACK
+  integer,  allocatable :: ipiv_W(:,:)
+  integer,  allocatable :: ipiv_LapU(:,:)
 
 contains
 
-  subroutine init_radial_matrices()
-    integer :: ell, n_ell
+!===============================================================
+! Build radial matrices for W and LapU:
+!   A_W(ℓ)    = I - α L_ℓ
+!   A_LapU(ℓ) = I - α L_ℓ   with modified BC at r=1
+!
+! L_ℓ f = f'' + (2/r) f' - ℓ(ℓ+1)/r² f
+! α = dt/(2Re)
+!===============================================================
+subroutine init_radial_matrices()
+  integer :: ell, i
+  real(dp) :: dr, alpha
+  real(dp) :: ri
+  integer :: n
 
-    n_ell = LMAX+1
-    allocate(A_W(n_ell, NR, NR))
-    allocate(A_LapU(n_ell, NR, NR))
-    allocate(ipiv_W(n_ell, NR))
-    allocate(ipiv_LapU(n_ell, NR))
+  n = NR
+  dr = (rmax - rmin) / real(NR-1,dp)
+  alpha = dt / (2.0_dp * Re)
 
-    ! TODO:
-    ! Pour chaque ell, construire la matrice radiale discrétisant:
-    !  (I - dt/(2Re) * (d²/dr² + 2/r d/dr - ell(ell+1)/r²)) pour W
-    !  (I - dt/(2Re) * Laplacien 4e ordre) pour LapU
-    !
-    ! Puis factoriser avec dgesv/dgbsv (&co) de LAPACK.
-    !
-    ! Pour l’instant, on met des identités.
-    A_W = 0.0_dp
-    A_LapU = 0.0_dp
-    do ell = 0, LMAX
-      A_W(ell, :,:)    = 0.0_dp
-      A_LapU(ell,:,:)  = 0.0_dp
-      A_W(ell,  :, :)  = 0.0_dp
-      A_LapU(ell,:, :) = 0.0_dp
-      ! identité:
-      A_W(ell, 1:NR,1:NR)   = 0.0_dp
-      A_LapU(ell,1:NR,1:NR) = 0.0_dp
-      A_W(ell, 1:NR,1:NR)   = A_W(ell,1:NR,1:NR) + diag_identity(NR)
-      A_LapU(ell,1:NR,1:NR) = A_LapU(ell,1:NR,1:NR) + diag_identity(NR)
+  allocate(A_W(0:LMAX, NR, NR))
+  allocate(A_LapU(0:LMAX, NR, NR))
+  allocate(ipiv_W(0:LMAX, NR))
+  allocate(ipiv_LapU(0:LMAX, NR))
+
+  do ell = 0, LMAX
+
+    A_W(ell,:,:) = 0.0_dp
+    A_LapU(ell,:,:) = 0.0_dp
+
+    !----------------------------------------------------------
+    ! Interior FD stencil: i = 2..NR-1
+    !----------------------------------------------------------
+    do i = 2, NR-1
+      ri = r(i)
+
+      ! f''
+      A_W(ell,i,i-1) = A_W(ell,i,i-1) + alpha * ( 1.0_dp / dr**2 - 1.0_dp/(ri*2.0_dp*dr) )
+      A_W(ell,i,i)   = A_W(ell,i,i)   + alpha * ( -2.0_dp / dr**2 - ell*(ell+1)/ri**2 )
+      A_W(ell,i,i+1) = A_W(ell,i,i+1) + alpha * ( 1.0_dp / dr**2 + 1.0_dp/(ri*2.0_dp*dr) )
+
+      ! Identity part (Crank–Nicolson)
+      A_W(ell,i,i) = A_W(ell,i,i) + 1.0_dp
     enddo
 
-  end subroutine init_radial_matrices
+    !----------------------------------------------------------
+    ! Boundary r=0 (regularity): W(0)=0
+    !----------------------------------------------------------
+    A_W(ell,1,:) = 0.0_dp
+    A_W(ell,1,1) = 1.0_dp
 
-  function diag_identity(n) result(mat)
-    integer, intent(in) :: n
-    real(dp) :: mat(n,n)
-    integer :: i
-    mat = 0.0_dp
-    do i = 1, n
-      mat(i,i) = 1.0_dp
-    enddo
-  end function diag_identity
+    !----------------------------------------------------------
+    ! Boundary r=1 (Dirichlet) for W: W(1)=given
+    !----------------------------------------------------------
+    A_W(ell,NR,:) = 0.0_dp
+    A_W(ell,NR,NR) = 1.0_dp
 
-  ! Solve A_W(ell) * x = b for each (ell,m)
-  subroutine solve_radial_W(ell, rhs, sol)
-    integer, intent(in) :: ell
-    complex(dp), intent(in)  :: rhs(NR)
-    complex(dp), intent(out) :: sol(NR)
+    !----------------------------------------------------------
+    ! Copy into A_LapU then change BC
+    !----------------------------------------------------------
+    A_LapU(ell,:,:) = A_W(ell,:,:)
 
-    ! TODO: utiliser dgesv sur la partie réelle/imag séparément
-    sol = rhs  ! stub
-  end subroutine solve_radial_W
+    ! BC for U: U(1)=0
+    A_LapU(ell,NR,:) = 0.0_dp
+    A_LapU(ell,NR,NR) = 1.0_dp
 
-  subroutine solve_radial_LapU(ell, rhs, sol)
-    integer, intent(in) :: ell
-    complex(dp), intent(in)  :: rhs(NR)
-    complex(dp), intent(out) :: sol(NR)
-    sol = rhs  ! stub
-  end subroutine solve_radial_LapU
+    ! derivative BC: U'(1)=0 → (U_NR - U_{NR-2})/(2dr)=0
+    A_LapU(ell,NR-1,:) = 0.0_dp
+    A_LapU(ell,NR-1,NR)   =  1.0_dp/(2.0_dp*dr)
+    A_LapU(ell,NR-1,NR-2) = -1.0_dp/(2.0_dp*dr)
+
+  enddo
+
+end subroutine init_radial_matrices
+
+!===============================================================
+! Solve A_W(ell)*x = rhs for complex rhs
+!===============================================================
+subroutine solve_radial_W(ell, rhs, sol)
+  integer, intent(in) :: ell
+  complex(dp), intent(in)  :: rhs(NR)
+  complex(dp), intent(out) :: sol(NR)
+  integer :: info, i
+  real(dp) :: b_re(NR), b_im(NR)
+  real(dp) :: A(NR,NR)
+
+  ! Copy matrix
+  A = A_W(ell,:,:)
+
+  ! Real system for Re(rhs)
+  do i = 1, NR
+    b_re(i) = real(rhs(i),dp)
+  enddo
+  call dgesv(NR, 1, A, NR, ipiv_W(ell,:), b_re, NR, info)
+
+  ! Real system for Im(rhs)
+  A = A_W(ell,:,:)   ! need to reload matrix (destroyed by dgesv)
+  do i = 1, NR
+    b_im(i) = aimag(rhs(i))
+  enddo
+  call dgesv(NR, 1, A, NR, ipiv_W(ell,:), b_im, NR, info)
+
+  do i = 1, NR
+    sol(i) = cmplx(b_re(i), b_im(i), kind=dp)
+  enddo
+end subroutine solve_radial_W
+
+
+!===============================================================
+! Solve A_LapU(ell)*x = rhs
+!===============================================================
+subroutine solve_radial_LapU(ell, rhs, sol)
+  integer, intent(in) :: ell
+  complex(dp), intent(in)  :: rhs(NR)
+  complex(dp), intent(out) :: sol(NR)
+  integer :: info, i
+  real(dp) :: b_re(NR), b_im(NR)
+  real(dp) :: A(NR,NR)
+
+  A = A_LapU(ell,:,:)
+
+  do i = 1, NR
+    b_re(i) = real(rhs(i),dp)
+  enddo
+  call dgesv(NR, 1, A, NR, ipiv_LapU(ell,:), b_re, NR, info)
+
+  A = A_LapU(ell,:,:)
+  do i = 1, NR
+    b_im(i) = aimag(rhs(i))
+  enddo
+  call dgesv(NR, 1, A, NR, ipiv_LapU(ell,:), b_im, NR, info)
+
+  do i = 1, NR
+    sol(i) = cmplx(b_re(i), b_im(i), kind=dp)
+  enddo
+end subroutine solve_radial_LapU
 
 end module mod_poisson_radial
+
