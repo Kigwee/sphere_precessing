@@ -1,117 +1,140 @@
-program precessing_sphere_dns
+program dns_sphere
   use mod_kinds
   use mod_params
   use mod_grid
-  use mod_field
   use mod_spectral_transforms
+  use mod_poisson_radial
+  use mod_operators
   use mod_torpol
   use mod_time_integration
   implicit none
 
   integer :: it
-  logical :: first_step
-  ! champs physiques pour NL
-  real(dp), allocatable :: ur(:,:,:), uth(:,:,:), uph(:,:,:)
-  real(dp), allocatable :: wr(:,:,:), wth(:,:,:), wph(:,:,:)
-  real(dp), allocatable :: NLr(:,:,:), NLth(:,:,:), NLph(:,:,:)
-  real(dp), allocatable :: U_phys(:,:,:), W_phys(:,:,:)
+  character(len=256) :: fname
+  real(dp) :: t, energy
 
-  call init_grids()
-  call allocate_fields()
+  !------------------------------------------------
+  ! 0. Initialisation générale
+  !------------------------------------------------
+  call init_params()            ! Si tu veux mettre des valeurs ici
+  call init_grid()              ! r,theta,phi
+  call init_sht()               ! SHTns FFT+Legendre
+  call init_radial_matrices()   ! Poisson radial CN
+  call init_angular_couplings() ! a(l,m)
+  call init_torpol()            ! allocate u,w arrays
+  call init_time_integrator()   ! allocate NL_old
 
-  allocate(ur(0:LMAX,0:2*MMAX,NR))
-  allocate(uth(0:LMAX,0:2*MMAX,NR))
-  allocate(uph(0:LMAX,0:2*MMAX,NR))
-  allocate(wr(0:LMAX,0:2*MMAX,NR))
-  allocate(wth(0:LMAX,0:2*MMAX,NR))
-  allocate(wph(0:LMAX,0:2*MMAX,NR))
-  allocate(NLr(0:LMAX,0:2*MMAX,NR))
-  allocate(NLth(0:LMAX,0:2*MMAX,NR))
-  allocate(NLph(0:LMAX,0:2*MMAX,NR))
-  allocate(U_phys(0:LMAX,0:2*MMAX,NR))
-  allocate(W_phys(0:LMAX,0:2*MMAX,NR))
+  ! Allocate main unknowns
+  allocate(U_hat(0:LMAX,-MMAX:MMAX,NR))
+  allocate(W_hat(0:LMAX,-MMAX:MMAX,NR))
+  allocate(LapU_hat(0:LMAX,-MMAX:MMAX,NR))
 
-  !-----------------------------------------------------------
-  ! Initialisation : rotation solide approx sur W, U=0
-  ! Ici en physique, puis projection en spectral
-  !-----------------------------------------------------------
-  U_phys = 0.0_dp
-  W_phys = 0.0_dp
-
-  ! Exemple simple : W(r=1,θ,φ) = sinθ cosφ ; on propage en r
-  call init_W_physical(W_phys)
-
-  call to_spectral_scalar(U_phys, U_hat)
-  call to_spectral_scalar(W_phys, W_hat)
-
+  U_hat    = (0.0_dp,0.0_dp)
+  W_hat    = (0.0_dp,0.0_dp)
   LapU_hat = (0.0_dp,0.0_dp)
 
-  RHS_W_hat     = (0.0_dp,0.0_dp)
-  RHS_W_hat_old = (0.0_dp,0.0_dp)
-  RHS_LapU_hat     = (0.0_dp,0.0_dp)
-  RHS_LapU_hat_old = (0.0_dp,0.0_dp)
+  !------------------------------------------------
+  ! 1. Conditions initiales (cas du papier)
+  !    W_{1,1}(r) = sinθ cosφ = mode (l=1,m=1)
+  !------------------------------------------------
+  call init_conditions(U_hat, W_hat)
 
-  first_step = .true.
+  t = 0.0_dp
 
-  !-----------------------------------------------------------
-  ! Boucle en temps
-  !-----------------------------------------------------------
+  write(*,*) "---------------------------------------------"
+  write(*,*) "   DNS tor/pol SHTns + Poisson CN/AB2 "
+  write(*,*) "---------------------------------------------"
+  write(*,*) "LMAX=",LMAX," MMAX=",MMAX," NR=",NR
+  write(*,*) "dt=",dt," Re=",Re," eps=",eps
+  write(*,*) "---------------------------------------------"
+
+  !------------------------------------------------
+  ! 2. Boucle en temps
+  !------------------------------------------------
   do it = 1, nsteps
+    t = t + dt
 
-    ! U_hat,W_hat -> vitesse u en physique
-    call compute_velocity_from_UW(U_hat, W_hat, ur, uth, uph)
-    call compute_vorticity(ur, uth, uph, wr, wth, wph)
-    call compute_nonlinear_term(ur, uth, uph, wr, wth, wph, NLr,NLth,NLph)
+    call time_step(U_hat, W_hat)
 
-    ! Projeter les termes non-linéaires vers RHS_W_hat, RHS_LapU_hat
-    call build_RHS_from_NL(NLr,NLth,NLph, RHS_W_hat, RHS_LapU_hat)
-
-    call time_step(first_step)
-    first_step = .false.
-
-    if (mod(it,nout)==0) then
-      write(*,*) 'it = ', it
-      ! TODO: sortir un champ pour visualisation, par ex u_r ou streamfunction
+    if (mod(it,monitor_freq)==0) then
+      energy = compute_energy(U_hat,W_hat)
+      write(*,'("it=",I6,"  t=",F10.4,"  E=",ES12.5)') it,t,energy
     endif
 
+    if (mod(it,output_freq)==0) then
+      write(fname,'("output/W_",I6.6,".bin")') it
+      call write_field_complex(fname, W_hat)
+
+      write(fname,'("output/U_",I6.6,".bin")') it
+      call write_field_complex(fname, U_hat)
+    endif
   enddo
+
+  write(*,*) "Simulation terminée."
 
 contains
 
-  subroutine init_W_physical(W_phys)
-    real(dp), intent(out) :: W_phys(0:LMAX,0:2*MMAX,NR)
-    integer :: ir,it,ip
-    real(dp) :: rr,th_loc,ph_loc
+  !----------------------------------------------------
+  ! CI spécifique au papier : W = sinθ cosφ
+  !----------------------------------------------------
+  subroutine init_conditions(U_hat, W_hat)
+    complex(dp), intent(inout) :: U_hat(0:LMAX,-MMAX:MMAX,NR)
+    complex(dp), intent(inout) :: W_hat(0:LMAX,-MMAX:MMAX,NR)
 
-    W_phys = 0.0_dp
+    real(dp), allocatable :: W_phys(:,:,:)
+    integer :: ir,i,j
+
+    allocate(W_phys(0:LMAX,0:2*MMAX,NR))
+
+    ! Build sinθ cosφ everywhere
     do ir = 1, NR
-      rr = r(ir)
-      do it = 0, LMAX
-        th_loc = theta(it)
-        do ip = 0, 2*MMAX
-          ph_loc = phi(ip)
-          ! BC type Kida-Nakayama : ~sinθ cosφ à la paroi
-          W_phys(it,ip,ir) = (rr/rmax) * sin(th_loc)*cos(ph_loc)
+      do i = 0, LMAX
+        do j = 0, 2*MMAX
+          W_phys(i,j,ir) = sin(theta(i)) * cos(phi(j))
         enddo
       enddo
     enddo
-  end subroutine init_W_physical
 
-  subroutine build_RHS_from_NL(NLr,NLth,NLph, RHS_W_hat, RHS_LapU_hat)
-    real(dp),    intent(in)  :: NLr(0:LMAX,0:2*MMAX,NR)
-    real(dp),    intent(in)  :: NLth(0:LMAX,0:2*MMAX,NR)
-    real(dp),    intent(in)  :: NLph(0:LMAX,0:2*MMAX,NR)
-    complex(dp), intent(out) :: RHS_W_hat(0:LMAX,-MMAX:MMAX,NR)
-    complex(dp), intent(out) :: RHS_LapU_hat(0:LMAX,-MMAX:MMAX,NR)
+    ! Transform into spectral
+    call to_spectral_scalar(W_phys, W_hat)
 
-    ! TODO:
-    ! Projeter les contributions non-linéaires dans l’équation de W et de LapU:
-    !    RHS_W ~ opérateur[Toro] appliqué à NL
-    !    RHS_LapU ~ opérateur[Pol] appliqué à NL
-    !
-    ! Pour l’instant, on met tout à zéro
-    RHS_W_hat    = (0.0_dp,0.0_dp)
-    RHS_LapU_hat = (0.0_dp,0.0_dp)
-  end subroutine build_RHS_from_NL
+    ! U initialized à 0
+    U_hat = (0.0_dp,0.0_dp)
+  end subroutine init_conditions
 
-end program precessing_sphere_dns
+
+  !----------------------------------------------------
+  ! Compute total kinetic energy from potentials
+  ! Approximate: E = ∑ |W|² + |∇²U|²
+  !----------------------------------------------------
+  function compute_energy(U_hat, W_hat) result(E)
+    complex(dp), intent(in) :: U_hat(0:LMAX,-MMAX:MMAX,NR)
+    complex(dp), intent(in) :: W_hat(0:LMAX,-MMAX:MMAX,NR)
+    real(dp) :: E
+    integer :: l,m,ir
+
+    E = 0.0_dp
+    do ir=1,NR
+      do l=0,LMAX
+        do m=-MMAX,MMAX
+          E = E + abs(W_hat(l,m,ir))**2 + abs(LapU_hat(l,m,ir))**2
+        enddo
+      enddo
+    enddo
+  end function compute_energy
+
+
+  !----------------------------------------------------
+  ! Writing binary field
+  !----------------------------------------------------
+  subroutine write_field_complex(filename, field)
+    character(len=*), intent(in) :: filename
+    complex(dp), intent(in) :: field(0:LMAX,-MMAX:MMAX,NR)
+    integer :: u
+
+    open(newunit=u,file=filename,form="unformatted",access="stream")
+    write(u) field
+    close(u)
+  end subroutine write_field_complex
+
+end program dns_sphere
